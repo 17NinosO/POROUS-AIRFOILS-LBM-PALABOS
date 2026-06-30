@@ -1,0 +1,9 @@
+# Ignore everything in this directory
+*
+# Except the following files and folders (the latter also contain a .gitignore)
+!.gitignore
+!runMultiGPU
+!CMakeLists.txt
+!tmp
+!build
+!cavity3d.cpp
