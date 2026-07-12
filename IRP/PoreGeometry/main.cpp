@@ -1,22 +1,29 @@
 // main.cpp
 #include <iostream>
-#include <random>
-#include "config.hpp"
-#include "pore_shape.hpp"
+#include "throats.hpp"
 
 int main() {
-    std::mt19937_64 rng(42);
+    pore_geometry::Vec2 p1{0.0, 0.0};
+    pore_geometry::Vec2 p2{10.0, 0.0};
+    double half_width = 2.0;
 
-    auto circle = pore_geometry::makeOrganicPore({0, 0}, 10.0, /*n_harmonics=*/0, /*roughness=*/3.0, rng);
-    auto organic = pore_geometry::makeOrganicPore({0, 0}, 10.0, /*n_harmonics=*/4, /*roughness=*/3.0, rng);
+    struct Check { pore_geometry::Vec2 p; bool expected; const char* label; };
+    Check checks[] = {
+        {{5.0, 0.0},  true,  "midpoint of segment"},
+        {{5.0, 1.9},  true,  "just inside, above midpoint"},
+        {{5.0, 2.1},  false, "just outside, above midpoint"},
+        {{0.0, 0.0},  true,  "exactly at p1"},
+        {{-0.5, 0.0}, true,  "past p1, but inside its rounded cap"},
+        {{-2.0, 0.0}, true,  "exactly on the cap boundary (distance == half_width)"},
+        {{-2.1, 0.0}, false, "just outside the cap"},
+        {{-3.0, 0.0}, false, "well past p1, outside the capsule entirely"},
+        {{13.0, 0.0}, false, "well past p2, outside the capsule entirely"},
+    };
 
-    std::cout << "n_harmonics=0 (should be exactly 10 everywhere):\n";
-    for (double theta = 0; theta < 6.29; theta += 1.57)
-        std::cout << "  theta=" << theta << " r=" << circle.radiusAt(theta) << "\n";
-
-    std::cout << "n_harmonics=4 (should vary around 10):\n";
-    for (double theta = 0; theta < 6.29; theta += 1.57)
-        std::cout << "  theta=" << theta << " r=" << organic.radiusAt(theta) << "\n";
-
+    for (auto& c : checks) {
+        bool got = pore_geometry::inCapsule(c.p, p1, p2, half_width);
+        std::cout << c.label << ": got=" << got << " expected=" << c.expected
+                   << (got == c.expected ? "  OK" : "  MISMATCH") << "\n";
+    }
     return 0;
 }
