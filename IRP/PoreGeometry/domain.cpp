@@ -77,6 +77,33 @@ DomainMask buildDomainMask(const GeometryConfig& config) {
         }
     }
 
+    // Open the block's left and right faces: extend one throat from each
+    // edge-column pore straight out to x=0 / x=domain_width, so flow can
+    // actually enter/exit through a pore, not hit a solid face.
+    if (config.throat_enabled) {
+        std::mt19937_64 edge_rng(config.seed + 4);
+        auto index = [&](int row, int col) { return std::size_t(row) * config.n_cols + col; };
+
+        for (int j = 0; j < config.n_rows; ++j) {
+            std::size_t left = index(j, 0);
+            double half_w_left = throatHalfWidth(config, radii[left], radii[left], edge_rng);
+            Vec2 left_edge{0.0, centers[left].y};
+            for (int row = 0; row < ny; ++row)
+                for (int col = 0; col < nx; ++col)
+                    if (inCapsule({col * config.resolution, row * config.resolution},
+                                  left_edge, centers[left], half_w_left))
+                        mask.set(row, col, true);
+
+            std::size_t right = index(j, config.n_cols - 1);
+            double half_w_right = throatHalfWidth(config, radii[right], radii[right], edge_rng);
+            Vec2 right_edge{config.domain_width, centers[right].y};
+            for (int row = 0; row < ny; ++row)
+                for (int col = 0; col < nx; ++col)
+                    if (inCapsule({col * config.resolution, row * config.resolution},
+                                  centers[right], right_edge, half_w_right))
+                        mask.set(row, col, true);
+        }
+    }
     return mask;
 }
 
