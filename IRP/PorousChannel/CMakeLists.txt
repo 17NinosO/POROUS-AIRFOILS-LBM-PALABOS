@@ -27,5 +27,12 @@ add_executable(porous_channel
     ${TINYXML_SOURCES}
 )
 
+add_executable(multigrid_test multigrid_test.cpp ${PLB_SOURCES} ${TINYXML_SOURCES})
+target_link_libraries(multigrid_test PRIVATE ${MPI_CXX_LIBRARIES} m tbb pore_geometry)
+
+add_executable(porous_channel_mg porous_channel_mg.cpp ${PLB_SOURCES} ${TINYXML_SOURCES})
+target_link_libraries(porous_channel_mg PRIVATE ${MPI_CXX_LIBRARIES} m tbb pore_geometry)
+target_compile_options(porous_channel_mg PRIVATE -O3 -Wall)
+
 target_link_libraries(porous_channel PRIVATE ${MPI_CXX_LIBRARIES} m pore_geometry)
 target_compile_options(porous_channel PRIVATE -O3 -Wall)
