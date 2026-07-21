@@ -290,7 +290,7 @@ Dynamics<T, DESCRIPTOR>* makeBulkDynamics() {
 //Initialisation
 //===================================================================================================
 
-void initializeDomain(MultiGridLattice2D<T, DESCRIPTOR>& lattice) {
+void initializeDomain(MultiGridLattice2D<T, DESCRIPTOR>& lattice, T AoA_rad) {
     using namespace param;
     const T rho_0 = 1.0;
     Array<T,2> u_inf(U_lb * std::cos(AoA_rad), U_lb * std::sin(AoA_rad));
@@ -307,25 +307,24 @@ void initializeDomain(MultiGridLattice2D<T, DESCRIPTOR>& lattice) {
 //===================================================================================================
 //Boundary Conditions
 //===================================================================================================
-void setBoundaryConditions(MultiGridLattice2D<T, DESCRIPTOR>& lattice) {
+void setBoundaryConditions(MultiGridLattice2D<T, DESCRIPTOR>& lattice, T AoA_rad) {
     using namespace param;
     Array<T, 2> u_inf(U_lb * std::cos(AoA_rad), U_lb * std::sin(AoA_rad));
 
-    // Domain-edge boundaries live on the coarse level only.
     MultiBlockLattice2D<T, DESCRIPTOR>& coarse = lattice.getComponent(0);
 
     OnLatticeBoundaryCondition2D<T, DESCRIPTOR>* bc =
         createLocalBoundaryCondition2D<T, DESCRIPTOR>();
 
+    // Inlet (left) — velocity
     bc->addVelocityBoundary0N(Box2D(0, 0, 1, Ly-2), coarse);
     setBoundaryVelocity(coarse, Box2D(0, 0, 1, Ly-2), u_inf);
+
+    // Outlet (right) — pressure
     bc->addPressureBoundary0P(Box2D(Lx-1, Lx-1, 1, Ly-2), coarse);
     setBoundaryDensity(coarse, Box2D(Lx-1, Lx-1, 1, Ly-2), (T)1.0);
-    bc->addVelocityBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), coarse);
-    setBoundaryVelocity(coarse, Box2D(1, Lx-2, Ly-1, Ly-1), u_inf);
-    bc->addVelocityBoundary1N(Box2D(1, Lx-2, 0, 0), coarse);
-    setBoundaryVelocity(coarse, Box2D(1, Lx-2, 0, 0), u_inf);
 
+    // Top and bottom — pressure (approximating the paper's open-boundary condition)
     bc->addPressureBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), coarse);
     setBoundaryDensity(coarse, Box2D(1, Lx-2, Ly-1, Ly-1), (T)1.0);
     bc->addPressureBoundary1N(Box2D(1, Lx-2, 0, 0), coarse);
@@ -347,7 +346,7 @@ void setBoundaryConditions(MultiGridLattice2D<T, DESCRIPTOR>& lattice) {
 //using the momentum exchange method
 //iterates only over the airfoil bounding box
 
-void computeCoefficients(T Fx, T Fy, T& Cl, T& Cd) {
+void computeCoefficients(T Fx, T Fy, T& Cl, T& Cd, T AoA_rad) {
     using namespace param;
 
     // Lattice-unit conversion (matches Gabriel's IncomprFlowParam convention)
@@ -396,12 +395,12 @@ void writeVTK(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iter, Box2D cons
 //Simulation Loop
 //===================================================================================================
 void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refineBox,
-                    plint interpLevel, Array<plint,2> forceIds)
+                    plint interpLevel, Array<plint,2> forceIds, T AoA_rad)
 {
     using namespace param;
     //Open force output file
     std::ofstream forceFile("forces.txt");
-    forceFile << "iter,avgEnergy\n";
+    forceFile << "iter,Cl,Cd\n";
 
     //Convergence Monitor
 util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol);
@@ -415,8 +414,9 @@ util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol)
         T Fx = lattice.getComponent(interpLevel).getInternalStatistics().getSum(forceIds[0]);
         T Fy = lattice.getComponent(interpLevel).getInternalStatistics().getSum(forceIds[1]);
         T Cl, Cd;
-        computeCoefficients(Fx, Fy, Cl, Cd);
+        computeCoefficients(Fx, Fy, Cl, Cd, AoA_rad);   // pass it here
         forceFile << iT << "," << Cl << "," << Cd << "\n";
+        forceFile.flush();
     }
 
     // Expensive: energy/VTK/convergence check at coarser cadence
@@ -449,12 +449,15 @@ util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol)
 int main(int argc, char* argv[]) {
     plbInit(&argc, &argv);
 
+    T AoA_deg_runtime = (argc > 1) ? std::atof(argv[1]) : param::AoA_deg;
+    T AoA_rad_runtime = AoA_deg_runtime * M_PI / 180.0;
+
     //Startup Summary
     pcout << "============================================\n";
     pcout << "   NACA 0012 LBM Simulation - Palabos 2D   \n";
     pcout << "============================================\n";
     pcout << "Re        = " << param::Re       << "\n";
-    pcout << "AoA       = " << param::AoA_deg  << " deg\n";
+    pcout << "AoA       = " << AoA_deg_runtime  << " deg\n";
     pcout << "Domain    = " << param::Lx << " x " << param::Ly << " cells\n";
     pcout << "Chord     = " << param::N_chord  << " cells\n";
     pcout << "tau       = " << param::tau      << "\n";
@@ -508,19 +511,17 @@ for (plint iLevel = 0; iLevel < numLevel; ++iLevel) {
 initializeMomentumExchange(lattice.getComponent(interpLevel), airfoilDomain);
 
     //Boundary Conditions
-    setBoundaryConditions(lattice);
+    setBoundaryConditions(lattice, AoA_rad_runtime);
     pcout << "Boundary conditions applied\n";
 
     //Initialise distribution functions
-    initializeDomain(lattice);
+    initializeDomain(lattice, AoA_rad_runtime);
     pcout << "Domain initialised at equilibrium\n";
 
-    initializeDomain(lattice);
-    pcout << "Domain initialised at equilibrium\n";
     pcout << "t=0 check: avgEnergy = " << computeAverageEnergy(lattice.getComponent(0)) << "\n";
 
     //run
-    runSimulation(lattice, refineBox, interpLevel, forceIds);
+    runSimulation(lattice, refineBox, interpLevel, forceIds, AoA_rad_runtime);
     
     return 0;
 }
