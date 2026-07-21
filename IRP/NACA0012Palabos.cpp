@@ -421,14 +421,18 @@ util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol)
 
     // Expensive: energy/VTK/convergence check at coarser cadence
     if (iT % outIter == 0) {
-        T avgEnergy = computeAverageEnergy(lattice.getComponent(0));
-        pcout << "iter=" << iT << " E=" << avgEnergy << "\n";
-        writeVTK(lattice, iT, refineBox);
-        convergence.takeValue(avgEnergy, true);
-        if (convergence.hasConverged()) {
-            pcout << "Converged at iter=" << iT << "\n";
-            break;
+    T avgEnergy = computeAverageEnergy(lattice.getComponent(0));
+    pcout << "iter=" << iT << " E=" << avgEnergy << "\n";
+    convergence.takeValue(avgEnergy, true);
+    if (convergence.hasConverged()) {
+        pcout << "Converged at iter=" << iT << "\n";
+        writeVTK(lattice, iT, refineBox);   // capture final state if converged early
+        break;
         }
+    }
+
+    if (iT == 0 || iT == maxIter/3 || iT == 2*maxIter/3 || iT == maxIter) {
+        writeVTK(lattice, iT, refineBox);
     }
 
     lattice.collideAndStream();
