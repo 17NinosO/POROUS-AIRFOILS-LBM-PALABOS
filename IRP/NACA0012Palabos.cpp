@@ -8,12 +8,13 @@
 #include <sstream>
 
 #include "complexDynamics/mrtDynamics.h"
+#include "boundaryCondition/bounceBackModels.h"
 #include "complexDynamics/mrtDynamics.hh"
 
 using namespace plb;    //Palabos namespace
 using namespace std;
 
-// Palabos is a template library (e.g. MultiBlockLattice2D<T, DESCRIPTOR>).
+// Palabos is a template library (e.g. MultiGridLattice2D<T, DESCRIPTOR>).
 //C++ requires template definitions to be visible at compile time, not just declarations.
 //Palabos ships .hh files containing full implementations, separate from the .h declaration headers.
 
@@ -48,14 +49,14 @@ namespace param {
 
     //Physical Parameters
     const T Re = 1000.0; //Reynolds number
-    const T AoA_deg = 5.0; //Angle of attack [degrees]
+    const T AoA_deg = 0.0; //Angle of attack [degrees]
     const T AoA_rad = AoA_deg * M_PI / 180.0; //Angle of attack [radians]
 
     //Lattice Resolution
     //N_chord: number of lattice cells spanning the chord
     //Higher = more accurate but more computationally expensive
     //100 is a good starting point; but use 50 for a quick test run.
-    const plint N_chord = 200;
+    const plint N_chord = 1024;
 
     //Lattice velocity
     //Must satisfy Ma__lb = U_lb / c_s << 1 for incompressible flow.
@@ -82,8 +83,8 @@ namespace param {
     //Domain Size [Lattice Unites]
     //Simple Rectangular domain: inlet left, outlet right, slip walls top and bottom.
     //8 chord lengths upstream and 16 chord lengths downstream of the airfoil.
-    const plint Lx = 25 * N_chord; // Domain Width
-    const plint Ly = 15 * N_chord; // Domain Height 
+    const plint Lx = 36 * N_chord; // Domain Width
+    const plint Ly = 16 * N_chord; // Domain Height 
     const plint x_foil = 8 * N_chord; // LE x position from the inlet.
     const plint y_foil = Ly / 2; // LE y centred vertically.
 
@@ -91,13 +92,18 @@ namespace param {
     const plint maxIter = 200000; //Maximum number of iterations.
     const plint outIter = 1000; //Output and Logging Interval
     const T convTol = 1e-6; //Velocity convergence tolerance.
+    const plint forceLogIter = 10; //Force/Cl/Cd logging interval
 
     // Collision model
     enum CollisionModel { BGK, MRT };
-    const CollisionModel collisionModel = MRT;   //change BGK/MRT
+    const CollisionModel collisionModel = BGK;   //change BGK/MRT
 
     //Porosity Parameters
-    const bool porous = true;
+    const bool porous = false;
+    // Grid refinement (Stage 1: coarse + one fine level, level-0 geometry only)
+    const plint numLevel     = 1;
+    const plint overlapWidth = 1;
+    const plint behaviorLevel = 0;
     const T pore_width = 0.02;
     const int n_pores = 4;
     const T pore_centre_x = 0.30;
@@ -163,22 +169,68 @@ bool isInsidePore(plint ix, plint iy) {
 //For every lattice cell (iX, iY) is inside the NACA solid
 //The airfoil leading edge sits at (param::x_foil, param::y_foil).
 
-bool isInsideAirfoil(plint ix, plint iy) {
+bool isInsideAirfoilReal(T x_coarse, T y_coarse) {
     using namespace param;
-
-    //Map to normalised chord frame
-    T x_norm = static_cast<T>(ix - x_foil) / static_cast<T>(N_chord);
-    T y_norm = static_cast<T>(iy - y_foil) / static_cast<T>(N_chord);
-
-    //Outside chord extent - definitely fluid
+    T x_norm = (x_coarse - x_foil) / static_cast<T>(N_chord);
+    T y_norm = (y_coarse - y_foil) / static_cast<T>(N_chord);
     if (x_norm < 0.0 || x_norm > 1.0) return false;
-
-    //Compute half thickness at this chord position
     T yt = naca0012Thickness(x_norm);
-
     bool insideBody = (std::fabs(y_norm) < yt);
+    return insideBody && !isInsidePore(static_cast<plint>(std::round(x_coarse)), static_cast<plint>(std::round(y_coarse)));
+}
 
-    return insideBody && !isInsidePore(ix, iy);
+namespace cellFlag {
+    const int FLUID = 0;    //Regular fluid cell
+    const int SOLID = 1;    //Airfoil interior
+    const int INLET = 2;    //Left boundary
+    const int OUTLET = 3;   //Right boundary
+    const int WALL = 4;     //Top and bottom boundaries
+}
+
+//Stamps SOLID flags for cells inside the airfoil, for one grid level.
+//Runs as a per-block functional (not a raw MultiScalarField2D::get() loop)
+//since get() on a field sharing a multi-block's real block structure
+//pays a per-call block-lookup cost that is ruinous across millions of cells.
+class SetAirfoilSolidOnLevel : public BoxProcessingFunctional2D_S<int> {
+public:
+    explicit SetAirfoilSolidOnLevel(plint scale_) : scale(scale_) { }
+
+    virtual void process(Box2D domain, ScalarField2D<int>& flags) {
+        Dot2D offset = flags.getLocation();
+        for (plint ix = domain.x0; ix <= domain.x1; ++ix) {
+            for (plint iy = domain.y0; iy <= domain.y1; ++iy) {
+                plint gx = ix + offset.x;
+                plint gy = iy + offset.y;
+                T x_coarse = static_cast<T>(gx) / scale;
+                T y_coarse = static_cast<T>(gy) / scale;
+                if (isInsideAirfoilReal(x_coarse, y_coarse)) {
+                    flags.get(ix, iy) = cellFlag::SOLID;
+                }
+            }
+        }
+    }
+
+    virtual SetAirfoilSolidOnLevel* clone() const {
+        return new SetAirfoilSolidOnLevel(*this);
+    }
+
+    virtual void getTypeOfModification(std::vector<modif::ModifT>& modified) const {
+        modified[0] = modif::staticVariables;
+    }
+
+private:
+    plint scale;
+};
+
+void stampAirfoilOnLevel(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iLevel, Array<plint,2> forceIds) {
+    MultiBlockLattice2D<T, DESCRIPTOR>& comp = lattice.getComponent(iLevel);
+    Box2D bb = comp.getBoundingBox();
+    plint scale = 1 << iLevel;
+
+    MultiScalarField2D<int> flags(comp);
+    applyProcessingFunctional(new SetAirfoilSolidOnLevel(scale), bb, flags);
+    defineDynamics(comp, flags, new MomentumExchangeBounceBack<T, DESCRIPTOR>(forceIds), cellFlag::SOLID);
+    pcout << "Airfoil stamped on level " << iLevel << "\n";
 }
 
 //===================================================================================================
@@ -218,85 +270,7 @@ void writeAirfoilGeometry(const std::string& filename, int nPoints=200) {
 //===================================================================================================
 
 //This section builds the flag matrix which is a scalar field that labels every cell as a fluid, solid, inlet, outlet or wall.
-//Creating the MultiBlockLattice and stamping the correct collision dynamics onto each cell type.
-
-namespace cellFlag {
-    const int FLUID = 0;    //Regular fluid cell
-    const int SOLID = 1;    //Airfoil interior
-    const int INLET = 2;    //Left boundary
-    const int OUTLET = 3;   //Right boundary
-    const int WALL = 4;     //Top and bottom boundaries
-}
-
-//Palabos decomposes the domain into blocks for parallel processing.
-//When you want to loop over cells you can't write a flat nested for loop over global indices.
-//Each parallel process only owns a portoin of the domain and the loop coordinates are local to that block.
-
-//Palabos solves this with processing functionals
-//These are objects that receive a block plus its local domain.
-//They use a getLocation() to convert local into global coordinates.
-
-//Stamping of solid flags onto all cells inside the airfoil geometry.
-//Inherits from BoxProcessingFunctional2D_S<int> - the <int> matches
-//the scaler field type (MultiScalarField2D<int>).
-
-class SetAirfoilSolid : public BoxProcessingFunctional2D_S<int> {
-public:
-    void process(Box2D domain, ScalarField2D<int>& flags) {
-
-        //getLocation() returns this blocks offset in the global coordinates.
-        //without this, ix/iy are local - wrong geometry placement.
-        Dot2D offset = flags.getLocation();
-
-        for (plint ix = domain.x0; ix <= domain.x1; ++ix) {
-            for (plint iy = domain.y0; iy<= domain.y1; ++iy) {
-
-                //Convert to global lattice coordinates
-                plint gx = ix + offset.x;
-                plint gy = iy + offset.y;
-
-                if (isInsideAirfoil(gx, gy)) {
-                    flags.get(ix, iy) = cellFlag::SOLID;
-                }
-            }
-        }
-    }
-
-    //Palabos requires these two boilerplate mathods on every functional:
-    //clone() lets Palabos copy the functional for each block it processes.
-    SetAirfoilSolid* clone() const {
-        return new SetAirfoilSolid(*this);
-    }
-
-    //Tell Palabos that this is written to the scalar field.
-    void getTypeOfModification(std::vector<modif::ModifT>& modified) const {
-        modified[0] = modif::staticVariables;
-    }
-};
-
-//Using setToConstant for the simple rectangular regions and the custom functional for the airfoil.
-//Populate a pre-allocated MultiScalarField2D<int> with cell type flags
-
-void buildGeometryFlags(MultiScalarField2D<int>& flags) {
-    using namespace param;
-
-    //Have every cell start as a fluid
-    setToConstant(flags, flags.getBoundingBox(), cellFlag::FLUID);
-
-    //Boundary Strips - Box2D(x0, x1, y0, y1) defines a rectangle region
-    setToConstant(flags, Box2D(0, 0, 0, Ly-1), cellFlag::INLET); //Left strip
-    setToConstant(flags, Box2D(Lx-1, Lx-1, 0, Ly-1), cellFlag::OUTLET); //Right strip
-    setToConstant(flags, Box2D(0, Lx-1, 0, 0), cellFlag::WALL); //Bottom strip
-    setToConstant(flags, Box2D(0, Lx-1, Ly-1, Ly-1), cellFlag::WALL); //Top strip
-
-    //Stamp the airfoil solid cells using the custom functional
-    //applyProcessingFunctional dispatches across the blocks
-    applyProcessingFunctional(
-        new SetAirfoilSolid(),
-        flags.getBoundingBox(),
-        flags
-    );
-}
+//Creating the MultiGridLattice and stamping the correct collision dynamics onto each cell type.
 
 // Returns a fresh dynamics object of the chosen type.
 // Called wherever the code needs "the bulk fluid dynamics".
@@ -309,112 +283,58 @@ Dynamics<T, DESCRIPTOR>* makeBulkDynamics() {
 }
 
 //Creating the lattice and assigning dynamics
-//Create the MultiBlockLattice2D, and assign dynamics from the flag matrix.
+//Create the MultiGridLattice2D, and assign dynamics from the flag matrix.
 //Returns a raw pointer
-
-MultiBlockLattice2D<T, DESCRIPTOR>* buildLattice(
-    MultiScalarField2D<int>& flags,
-    Array<plint,2>& forceIds)                    // <-- NEW parameter
-{
-    using namespace param;
-
-    MultiBlockLattice2D<T, DESCRIPTOR>* lattice =
-        new MultiBlockLattice2D<T, DESCRIPTOR>(
-            Lx, Ly, makeBulkDynamics());
-
-    lattice->periodicity().toggleAll(false);
-
-    //Subscribe x and y force components to internal statistics
-    forceIds[0] = lattice->internalStatSubscription().subscribeSum();
-    forceIds[1] = lattice->internalStatSubscription().subscribeSum();
-
-    //MomentumExchangeBounceBack instead of plain BounceBack
-    defineDynamics(*lattice, flags,
-                   new MomentumExchangeBounceBack<T, DESCRIPTOR>(forceIds),
-                   cellFlag::SOLID);
-
-    // NEW: required to initialise the momentum-exchange machinery
-    initializeMomentumExchange(*lattice, lattice->getBoundingBox());
-
-    return lattice;
-}
 
 //===================================================================================================
 //Initialisation
 //===================================================================================================
 
-void initializeDomain(MultiBlockLattice2D<T, DESCRIPTOR>& lattice) {
+void initializeDomain(MultiGridLattice2D<T, DESCRIPTOR>& lattice) {
     using namespace param;
-
-    //Initial Density
-    //In LBM lattice units, density is normalised: rho = 1
-    //Pressure is related by: rho = rho * cs_sq, so p = rho/3
     const T rho_0 = 1.0;
+    Array<T,2> u_inf(U_lb * std::cos(AoA_rad), U_lb * std::sin(AoA_rad));
 
-    //Free stream velocity
-    //This is the AoA implementation.
-
-    Array<T,2> u_inf(
-        U_lb * std::cos(AoA_rad),
-        U_lb * std::sin(AoA_rad)
-    );
-
-    //Set the distribution function f_i = f_ieq(rho_0, u_inf) in the domain
-    //Palabos computes the full equilibrium formula internally.
-    //We pass the bounding box so it applies to the entire lattice.
-
-    initializeAtEquilibrium(
-        lattice,
-        lattice.getBoundingBox(),
-        rho_0,
-        u_inf
-    );
-
+    for (plint iLevel = 0; iLevel < lattice.getNumLevels(); ++iLevel) {
+        initializeAtEquilibrium(
+            lattice.getComponent(iLevel),
+            lattice.getComponent(iLevel).getBoundingBox(),
+            rho_0, u_inf);
+    }
     lattice.initialize();
 }
 
 //===================================================================================================
 //Boundary Conditions
 //===================================================================================================
-void setBoundaryConditions(MultiBlockLattice2D<T, DESCRIPTOR>& lattice) {
+void setBoundaryConditions(MultiGridLattice2D<T, DESCRIPTOR>& lattice) {
     using namespace param;
+    Array<T, 2> u_inf(U_lb * std::cos(AoA_rad), U_lb * std::sin(AoA_rad));
 
-    //Free-stream velocity vector where AoA is encoded as direction
-    Array<T, 2> u_inf(
-        U_lb * std::cos(AoA_rad),
-        U_lb * std::sin(AoA_rad)
-    );
+    // Domain-edge boundaries live on the coarse level only.
+    MultiBlockLattice2D<T, DESCRIPTOR>& coarse = lattice.getComponent(0);
 
-    //Create the Zou-He boundary condition object
     OnLatticeBoundaryCondition2D<T, DESCRIPTOR>* bc =
-    createLocalBoundaryCondition2D<T, DESCRIPTOR>();
+        createLocalBoundaryCondition2D<T, DESCRIPTOR>();
 
-    //Inlet Left wall
-    //Skip corner cells
-    bc->addVelocityBoundary0N(Box2D(0, 0, 1, Ly-2), lattice);
-    setBoundaryVelocity(lattice, Box2D(0, 0, 1, Ly-2), u_inf);
+    bc->addVelocityBoundary0N(Box2D(0, 0, 1, Ly-2), coarse);
+    setBoundaryVelocity(coarse, Box2D(0, 0, 1, Ly-2), u_inf);
+    bc->addPressureBoundary0P(Box2D(Lx-1, Lx-1, 1, Ly-2), coarse);
+    setBoundaryDensity(coarse, Box2D(Lx-1, Lx-1, 1, Ly-2), (T)1.0);
+    bc->addVelocityBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), coarse);
+    setBoundaryVelocity(coarse, Box2D(1, Lx-2, Ly-1, Ly-1), u_inf);
+    bc->addVelocityBoundary1N(Box2D(1, Lx-2, 0, 0), coarse);
+    setBoundaryVelocity(coarse, Box2D(1, Lx-2, 0, 0), u_inf);
 
-    //Outlet Right wall
-    //Density as 1
-    //Velocity not prescribed to let flow exit freely
-    bc->addPressureBoundary0P(Box2D(Lx-1, Lx-1, 1, Ly-2), lattice);
-    setBoundaryDensity(lattice, Box2D(Lx-1, Lx-1, 1, Ly-2), (T)1.0);
+    bc->addPressureBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), coarse);
+    setBoundaryDensity(coarse, Box2D(1, Lx-2, Ly-1, Ly-1), (T)1.0);
+    bc->addPressureBoundary1N(Box2D(1, Lx-2, 0, 0), coarse);
+    setBoundaryDensity(coarse, Box2D(1, Lx-2, 0, 0), (T)1.0);
 
-    //Top wall
-    //Free stream velocity condition
-    //Domain is 15c tall so is reasonable
-    bc->addVelocityBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), lattice);
-    setBoundaryVelocity(lattice, Box2D(1, Lx-2, Ly-1, Ly-1), u_inf);
-
-    //Bottom wall
-    bc->addVelocityBoundary1N(Box2D(1, Lx-2, 0, 0), lattice);
-    setBoundaryVelocity(lattice, Box2D(1, Lx-2, 0, 0), u_inf);
-
-    //Corner Walls
-    defineDynamics(lattice, Box2D(0,    0,    0,    0   ), new BounceBack<T,DESCRIPTOR>());  // bottom-left
-    defineDynamics(lattice, Box2D(0,    0,    Ly-1, Ly-1), new BounceBack<T,DESCRIPTOR>());  // top-left
-    defineDynamics(lattice, Box2D(Lx-1, Lx-1, 0,    0   ), new BounceBack<T,DESCRIPTOR>());  // bottom-right
-    defineDynamics(lattice, Box2D(Lx-1, Lx-1, Ly-1, Ly-1), new BounceBack<T,DESCRIPTOR>());  // top-right
+    defineDynamics(coarse, Box2D(0,0,0,0),       new BounceBack<T,DESCRIPTOR>());
+    defineDynamics(coarse, Box2D(0,0,Ly-1,Ly-1), new BounceBack<T,DESCRIPTOR>());
+    defineDynamics(coarse, Box2D(Lx-1,Lx-1,0,0), new BounceBack<T,DESCRIPTOR>());
+    defineDynamics(coarse, Box2D(Lx-1,Lx-1,Ly-1,Ly-1), new BounceBack<T,DESCRIPTOR>());
 
     delete bc;
 }
@@ -449,28 +369,39 @@ void computeCoefficients(T Fx, T Fy, T& Cl, T& Cd) {
     Cd = drag / (q_inf * area);
 }
 
-void writeVTK(MultiBlockLattice2D<T, DESCRIPTOR>& lattice, plint iter) {
-    VtkImageOutput2D<T> vtkOut(createFileName("vtk", iter, 6), 1.0);
-    vtkOut.writeData<float>(
-        *computeVelocityNorm(lattice), "velocityNorm", 1.0);
-    vtkOut.writeData<2, float>(
-        *computeVelocity(lattice), "velocity", 1.0);
-    vtkOut.writeData<float>(
-        *computeDensity(lattice), "density", 1.0);
+void writeVTK(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iter, Box2D const& refineBox) {
+    for (plint iLevel = 0; iLevel < lattice.getNumLevels(); ++iLevel) {
+        MultiBlockLattice2D<T, DESCRIPTOR>& c = lattice.getComponent(iLevel);
+
+        // Level 0: write the full domain. Level >0: write only the real
+        // refined patch (its reported bounding box is the WHOLE domain
+        // scaled by 2^level, but only refineBox*2^level actually has data).
+        Box2D writeBox = c.getBoundingBox();
+        if (iLevel > 0) {
+            plint scale = 1 << iLevel;
+            writeBox = Box2D(refineBox.x0 * scale, refineBox.x1 * scale,
+                              refineBox.y0 * scale, refineBox.y1 * scale);
+        }
+
+        VtkImageOutput2D<T> vtkOut(
+            createFileName("vtk_level" + std::to_string(iLevel), iter, 6),
+            1.0 / std::pow(2.0, iLevel));
+        vtkOut.writeData<float>(*computeVelocityNorm(c, writeBox), "velocityNorm", 1.0);
+        vtkOut.writeData<2, float>(*computeVelocity(c, writeBox), "velocity", 1.0);
+        vtkOut.writeData<float>(*computeDensity(c, writeBox), "density", 1.0);
+    }
 }
 
 //===================================================================================================
 //Simulation Loop
 //===================================================================================================
-void runSimulation(
-    MultiBlockLattice2D<T,DESCRIPTOR>& lattice,
-    MultiScalarField2D<int>& flags,
-    Array<plint,2>& forceIds)
+void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refineBox,
+                    plint interpLevel, Array<plint,2> forceIds)
 {
     using namespace param;
     //Open force output file
     std::ofstream forceFile("forces.txt");
-    forceFile << "iter,Cl,Cd,avgEnergy\n";
+    forceFile << "iter,avgEnergy\n";
 
     //Convergence Monitor
 util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol);
@@ -478,41 +409,30 @@ util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol)
     pcout << "Starting simulation: " << maxIter << " max iterations\n";
 
     for (plint iT = 0; iT <= maxIter; ++iT) {
-        //Output block
-        if (iT % outIter == 0) {
-            T avgEnergy = computeAverageEnergy(lattice);
 
-            if (iT > 5000) {
-                T Fx = lattice.getInternalStatistics().getSum(forceIds[0]);
-                T Fy = lattice.getInternalStatistics().getSum(forceIds[1]);
-                T Cl, Cd;
-                computeCoefficients(Fx, Fy, Cl, Cd);
-
-                forceFile << iT << "," << Cl << "," << Cd << ","
-                          << avgEnergy << "\n";
-
-                pcout << "iter=" << iT
-                    << " Cl=" << Cl
-                    << " Cd=" << Cd
-                    << " E=" << avgEnergy << "\n";
-            } else {
-                pcout << "iter=" << iT
-                    << " [transient] E=" << avgEnergy << "\n";
-            }
-
-            //Write VTK snapshot
-            writeVTK(lattice, iT);
-
-            //Feed convergence monitor
-            convergence.takeValue(avgEnergy, true);
-            if (convergence.hasConverged()) {
-                pcout << "Converged at iter=" << iT << "\n";
-                break;
-            }
-        }
-
-        lattice.collideAndStream();
+    // Cheap: log forces every iteration (or every few) for proper time-resolution
+    if (iT % forceLogIter == 0) {
+        T Fx = lattice.getComponent(interpLevel).getInternalStatistics().getSum(forceIds[0]);
+        T Fy = lattice.getComponent(interpLevel).getInternalStatistics().getSum(forceIds[1]);
+        T Cl, Cd;
+        computeCoefficients(Fx, Fy, Cl, Cd);
+        forceFile << iT << "," << Cl << "," << Cd << "\n";
     }
+
+    // Expensive: energy/VTK/convergence check at coarser cadence
+    if (iT % outIter == 0) {
+        T avgEnergy = computeAverageEnergy(lattice.getComponent(0));
+        pcout << "iter=" << iT << " E=" << avgEnergy << "\n";
+        writeVTK(lattice, iT, refineBox);
+        convergence.takeValue(avgEnergy, true);
+        if (convergence.hasConverged()) {
+            pcout << "Converged at iter=" << iT << "\n";
+            break;
+        }
+    }
+
+    lattice.collideAndStream();
+}
 
     forceFile.close();
     pcout << "Simulation complete. Forces saved to forces.txt\n";
@@ -547,23 +467,56 @@ int main(int argc, char* argv[]) {
     pcout << "Airfoil geometry written to airfoil_geometry.csv\n";
 
     //Build flag matrix and lattice
-MultiScalarField2D<int> flags(param::Lx, param::Ly);
-    buildGeometryFlags(flags);
-    Array<plint,2> forceIds;
-    MultiBlockLattice2D<T, DESCRIPTOR>* lattice = buildLattice(flags, forceIds);
+plint numLevel = 1, overlapWidth = 1, behaviorLevel = 0;
+    MultiGridManagement2D management(param::Lx, param::Ly, numLevel, overlapWidth, behaviorLevel);
+    Box2D refineBox(param::x_foil - param::N_chord/2, param::x_foil + 2*param::N_chord,
+                    param::y_foil - param::N_chord,   param::y_foil + param::N_chord);
+    // NOTE: management.refine(0, refineBox) removed — no refinement for this single-level pass
+
+    plint xTiles = global::mpi().getSize(), yTiles = 1, interpLevel = numLevel - 1;   // interpLevel = 0
+    ParallellizeBySquares2D* parallelizer = new ParallellizeBySquares2D(
+        management.getBulks(), management.getBoundingBox(interpLevel), xTiles, yTiles);
+    management.parallelize(parallelizer);
+
+    MultiGridLattice2D<T, DESCRIPTOR> lattice =
+        *MultiGridGenerator2D<T, DESCRIPTOR>::createRefinedLatticeCubicInterpolationFiltering(
+            management, makeBulkDynamics(), behaviorLevel);
     pcout << "Lattice built: " << param::Lx * param::Ly << " cells\n";
 
+    Box2D bb0 = lattice.getComponent(0).getBoundingBox();
+    pcout << "Level 0 bbox: x[" << bb0.x0 << "," << bb0.x1 << "] y[" << bb0.y0 << "," << bb0.y1 << "]\n";
+    // Level 1 bbox print removed — no level 1 exists in this configuration
+
+    // airfoilDomain: global (level-0) coordinates. interpLevel == 0 here, so no rescaling needed.
+    Box2D airfoilDomain(param::x_foil - 2, param::x_foil + param::N_chord + 2,
+                         param::y_foil - param::N_chord/4, param::y_foil + param::N_chord/4);
+    
+    Array<plint,2> forceIds;
+    forceIds[0] = lattice.getComponent(interpLevel).internalStatSubscription().subscribeSum();
+    forceIds[1] = lattice.getComponent(interpLevel).internalStatSubscription().subscribeSum();
+
+
+// Stamp airfoil geometry on every grid level
+for (plint iLevel = 0; iLevel < numLevel; ++iLevel) {
+    stampAirfoilOnLevel(lattice, iLevel, forceIds);
+}
+
+initializeMomentumExchange(lattice.getComponent(interpLevel), airfoilDomain);
+
     //Boundary Conditions
-    setBoundaryConditions(*lattice);
+    setBoundaryConditions(lattice);
     pcout << "Boundary conditions applied\n";
 
     //Initialise distribution functions
-    initializeDomain(*lattice);
+    initializeDomain(lattice);
     pcout << "Domain initialised at equilibrium\n";
 
-    //run
-runSimulation(*lattice, flags, forceIds);
+    initializeDomain(lattice);
+    pcout << "Domain initialised at equilibrium\n";
+    pcout << "t=0 check: avgEnergy = " << computeAverageEnergy(lattice.getComponent(0)) << "\n";
 
-    delete lattice;
+    //run
+    runSimulation(lattice, refineBox, interpLevel, forceIds);
+    
     return 0;
 }
