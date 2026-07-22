@@ -31,3 +31,11 @@ add_executable(NACA0012
 
 target_link_libraries(NACA0012 PRIVATE ${MPI_CXX_LIBRARIES} m)
 target_compile_options(NACA0012 PRIVATE -O3 -Wall)
+
+add_executable(NACA0012_MG
+    NACA0012Palabos_Multigrid.cpp
+    ${PLB_SOURCES}
+    ${TINYXML_SOURCES}
+)
+target_link_libraries(NACA0012_MG PRIVATE ${MPI_CXX_LIBRARIES} m)
+target_compile_options(NACA0012_MG PRIVATE -O3 -Wall)
