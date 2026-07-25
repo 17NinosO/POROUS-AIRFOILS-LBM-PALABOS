@@ -58,7 +58,7 @@ namespace param {
     //---------------------------------------------------------------------
     // N_chord_fine: desired EFFECTIVE chord resolution at the airfoil surface
     // (the number we actually validate against the paper's N=512/1024 cases).
-    const plint N_chord_fine = 400;
+    const plint N_chord_fine = 1024;
 
     // numLevel: number of grid levels. 2 = one coarse + one refined level.
     // Start at 2 and validate before going further (matches the earlier
@@ -96,7 +96,7 @@ namespace param {
     const plint y_foil = Ly / 2;      // LE y centred vertically.
 
     //Simulation Control Parameters
-    const plint maxIter = 30000;
+    const plint maxIter = 20000;
     const plint outIter = 1000;
     const T convTol = 1e-6;
     const plint forceLogIter = 10;
