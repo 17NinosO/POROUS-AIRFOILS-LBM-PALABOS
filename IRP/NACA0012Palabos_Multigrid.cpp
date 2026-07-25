@@ -58,7 +58,7 @@ namespace param {
     //---------------------------------------------------------------------
     // N_chord_fine: desired EFFECTIVE chord resolution at the airfoil surface
     // (the number we actually validate against the paper's N=512/1024 cases).
-    const plint N_chord_fine = 1024;
+    const plint N_chord_fine = 400;
 
     // numLevel: number of grid levels. 2 = one coarse + one refined level.
     // Start at 2 and validate before going further (matches the earlier
@@ -96,7 +96,7 @@ namespace param {
     const plint y_foil = Ly / 2;      // LE y centred vertically.
 
     //Simulation Control Parameters
-    const plint maxIter = 200000;
+    const plint maxIter = 30000;
     const plint outIter = 1000;
     const T convTol = 1e-6;
     const plint forceLogIter = 10;
@@ -295,11 +295,11 @@ void setBoundaryConditions(MultiGridLattice2D<T, DESCRIPTOR>& lattice, T AoA_rad
     bc->addPressureBoundary0P(Box2D(Lx-1, Lx-1, 1, Ly-2), coarse);
     setBoundaryDensity(coarse, Box2D(Lx-1, Lx-1, 1, Ly-2), (T)1.0);
 
-    // Top and bottom — pressure (approximating the paper's open-boundary condition)
-    bc->addPressureBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), coarse);
-    setBoundaryDensity(coarse, Box2D(1, Lx-2, Ly-1, Ly-1), (T)1.0);
-    bc->addPressureBoundary1N(Box2D(1, Lx-2, 0, 0), coarse);
-    setBoundaryDensity(coarse, Box2D(1, Lx-2, 0, 0), (T)1.0);
+    // Top and bottom — velocity, matching free-stream (Gabriel's reference approach)
+    bc->addVelocityBoundary1P(Box2D(1, Lx-2, Ly-1, Ly-1), coarse);
+    setBoundaryVelocity(coarse, Box2D(1, Lx-2, Ly-1, Ly-1), u_inf);
+    bc->addVelocityBoundary1N(Box2D(1, Lx-2, 0, 0), coarse);
+    setBoundaryVelocity(coarse, Box2D(1, Lx-2, 0, 0), u_inf);
 
     defineDynamics(coarse, Box2D(0,0,0,0),       new BounceBack<T,DESCRIPTOR>());
     defineDynamics(coarse, Box2D(0,0,Ly-1,Ly-1), new BounceBack<T,DESCRIPTOR>());
