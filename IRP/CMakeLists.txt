@@ -39,3 +39,11 @@ add_executable(NACA0012_MG
 )
 target_link_libraries(NACA0012_MG PRIVATE ${MPI_CXX_LIBRARIES} m)
 target_compile_options(NACA0012_MG PRIVATE -O3 -Wall)
+
+add_executable(NACA0012_Porous_MG
+    NACA0012Palabos_Porous_Multigrid.cpp
+    ${PLB_SOURCES}
+    ${TINYXML_SOURCES}
+)
+target_link_libraries(NACA0012_Porous_MG PRIVATE ${MPI_CXX_LIBRARIES} m)
+target_compile_options(NACA0012_Porous_MG PRIVATE -O3 -Wall)
