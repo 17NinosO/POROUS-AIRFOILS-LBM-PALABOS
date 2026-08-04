@@ -185,19 +185,18 @@ int main(int argc, char* argv[]) {
             pcout << "\n";
             previousEnergy = energy;
 
-            Box2D refineBoxForWrite(blockX0, blockX0 + blockNx - 1, blockY0, blockY0 + blockNy - 1);
-            for (plint iLevel = 0; iLevel < lattice.getNumLevels(); ++iLevel) {
-                MultiBlockLattice2D<T, DESCRIPTOR>& comp = lattice.getComponent(iLevel);
-                plint scale = 1 << iLevel;
-                Box2D writeBox = comp.getBoundingBox();
-                if (iLevel > 0)
-                    writeBox = Box2D(refineBoxForWrite.x0 * scale, refineBoxForWrite.x1 * scale,
-                                      refineBoxForWrite.y0 * scale, refineBoxForWrite.y1 * scale);
-                VtkImageOutput2D<T> vtkOut(
-                    createFileName("porous_mg_level" + std::to_string(iLevel), iT, 6),
-                    1.0 / static_cast<double>(scale));
-                vtkOut.writeData<2, float>(*computeVelocity(comp, writeBox), "velocity", 1.0);
-            }
+            // Merge all levels into one combined lattice at level 3's
+            // resolution -- fine data where it exists, coarse
+            // interpolated elsewhere. Large (whole channel at finest
+            // spacing), written every checkpoint by design.
+            plint interpLevel = 3;
+            std::unique_ptr<MultiBlockLattice2D<T, DESCRIPTOR>> combined =
+                lattice.convertToLevel(interpLevel);
+            plint scale = 1 << interpLevel;
+            VtkImageOutput2D<T> vtkOut(
+                createFileName("porous_mg_combined", iT, 6),
+                1.0 / static_cast<double>(scale));
+            vtkOut.writeData<2, float>(*computeVelocity(*combined), "velocity", 1.0);
         }
         lattice.collideAndStream();
     }

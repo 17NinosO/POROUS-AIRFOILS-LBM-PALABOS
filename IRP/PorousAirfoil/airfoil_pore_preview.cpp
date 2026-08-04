@@ -85,7 +85,23 @@ int main() {
     std::cout << "raw pore radii: ";
     for (double r : radii) std::cout << r << " ";
     std::cout << "\n";
-}
+    }
+    {
+    auto centers = generateLatticeCentres(poreConfig);
+    for (std::size_t k = 0; k < centers.size(); ++k) {
+        int col = static_cast<int>(k) % poreConfig.n_cols;
+        int row = static_cast<int>(k) / poreConfig.n_cols;
+        double x_norm = centers[k].x;  // pore_domain_width == 1.0, so this IS x_norm directly
+        double y_norm = centers[k].y - poreConfig.domain_height / 2.0;
+        double available = naca0012Thickness(x_norm) - std::fabs(y_norm);
+        double needed = poreConfig.r_mean;
+        std::cout << "row=" << row << " col=" << col
+                  << " x=" << x_norm << " y_offset=" << y_norm
+                  << " available_clearance=" << available
+                  << " needed=" << needed
+                  << (available < needed ? "  <-- CLIPPED" : "") << "\n";
+    }
+    }
     auto poreMaskRaw = buildDomainMask(poreConfig);
     PoreLookup poreLookup{std::move(poreMaskRaw), poreConfig.domain_width, poreConfig.domain_height, poreConfig.resolution};
 

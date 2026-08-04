@@ -50,7 +50,7 @@ namespace param {
 
     //Physical Parameters
     const T Re = 1000.0; //Reynolds number
-    const T AoA_deg = 0.0; //Angle of attack [degrees] (default; overridable via argv[1])
+    const T AoA_deg = 11.0; //Angle of attack [degrees] (default; overridable via argv[1])
     const T AoA_rad = AoA_deg * M_PI / 180.0; //Angle of attack [radians]
 
     //---------------------------------------------------------------------
@@ -58,7 +58,7 @@ namespace param {
     //---------------------------------------------------------------------
     // N_chord_fine: desired EFFECTIVE chord resolution at the airfoil surface
     // (the number we actually validate against the paper's N=512/1024 cases).
-    const plint N_chord_fine = 1024;
+    const plint N_chord_fine = 400;
 
     // numLevel: number of grid levels. 2 = one coarse + one refined level.
     // Start at 2 and validate before going further (matches the earlier
@@ -96,7 +96,7 @@ namespace param {
     const plint y_foil = Ly / 2;      // LE y centred vertically.
 
     //Simulation Control Parameters
-    const plint maxIter = 20000;
+    const plint maxIter = 100000;
     const plint outIter = 1000;
     const T convTol = 1e-6;
     const plint forceLogIter = 10;
@@ -315,8 +315,8 @@ void setBoundaryConditions(MultiGridLattice2D<T, DESCRIPTOR>& lattice, T AoA_rad
 
 void computeCoefficients(T Fx, T Fy, T& Cl, T& Cd, T AoA_rad) {
     using namespace param;
-    T dx = 1.0 / (T)N_chord;
-    T dt = U_lb / (T)N_chord;
+    T dx = 1.0 / (T)N_chord_fine;       // force measured on finest level — use FINE chord length
+    T dt = U_lb / (T)N_chord_fine;      // (assumes convective scaling: dx/dt ratio preserved across levels)
     T scale = dx*dx*dx / (dt*dt);
 
     T Fx_phys = 2.0 * Fx * scale;
@@ -374,6 +374,15 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
         if (iT % forceLogIter == 0) {
             T Fx = lattice.getComponent(interpLevel).getInternalStatistics().getSum(forceIds[0]);
             T Fy = lattice.getComponent(interpLevel).getInternalStatistics().getSum(forceIds[1]);
+
+            // The fine level's collideAndStream() runs 2^interpLevel times per single
+            // outer call (Palabos multigrid convective sub-stepping), but evaluateStatistics()
+            // only fires once at the end — so getSum() returns the accumulated total across
+            // all sub-steps, not one. Divide back down to a per-coarse-iteration value.
+            const T subStepsPerCoarseIter = static_cast<T>(1 << interpLevel);
+            Fx /= subStepsPerCoarseIter;
+            Fy /= subStepsPerCoarseIter;
+
             T Cl, Cd;
             computeCoefficients(Fx, Fy, Cl, Cd, AoA_rad);
             forceFile << iT << "," << Cl << "," << Cd << "\n";
@@ -391,8 +400,8 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
             }
         }
 
-        if (iT == 0 || iT == maxIter/3 || iT == 2*maxIter/3 || iT == maxIter) {
-            writeVTK(lattice, iT, refineBox);
+        if (iT % 10000 == 0 || iT == maxIter) {
+        writeVTK(lattice, iT, refineBox);
         }
 
         lattice.collideAndStream();
@@ -439,8 +448,8 @@ int main(int argc, char* argv[]) {
     // upstream margin, 2 chords above/below. All in COARSE (level-0) units;
     // management.refine() and writeVTK both apply the 2^level scaling
     // internally/explicitly where needed.
-    Box2D refineBox(param::x_foil - 2*param::N_chord, param::x_foil + 6*param::N_chord,
-                     param::y_foil - 2*param::N_chord, param::y_foil + 2*param::N_chord);
+    Box2D refineBox(param::x_foil - 2*param::N_chord, param::x_foil + 12*param::N_chord,
+                     param::y_foil - 4*param::N_chord, param::y_foil + 4*param::N_chord);
     management.refine(0, refineBox);
 
     plint xTiles = global::mpi().getSize(), yTiles = 1, interpLevel = numLevel - 1;
@@ -455,13 +464,29 @@ int main(int argc, char* argv[]) {
 
     Box2D bb0 = lattice.getComponent(0).getBoundingBox();
     pcout << "Level 0 bbox: x[" << bb0.x0 << "," << bb0.x1 << "] y[" << bb0.y0 << "," << bb0.y1 << "]\n";
+    
     Box2D bb1 = lattice.getComponent(interpLevel).getBoundingBox();
     pcout << "Level " << interpLevel << " bbox: x[" << bb1.x0 << "," << bb1.x1
           << "] y[" << bb1.y0 << "," << bb1.y1 << "]\n";
 
+    // Explicitly rescale relaxation rate per level (Lagrava et al. 2012, Eq. 24),
+    // overriding whatever the generator assigned internally — verifies correctness
+    // rather than trusting unconfirmed library behavior.
+    {
+        T omega_level = param::omega;   // level 0's omega
+        for (plint iLevel = 1; iLevel < numLevel; ++iLevel) {
+            omega_level = 2.0 * omega_level / (4.0 - omega_level);
+            MultiBlockLattice2D<T, DESCRIPTOR>& comp = lattice.getComponent(iLevel);
+            defineDynamics(comp, comp.getBoundingBox(), new BGKdynamics<T, DESCRIPTOR>(omega_level));
+            pcout << "Level " << iLevel << " rescaled omega = " << omega_level
+                  << " (tau = " << 1.0/omega_level << ")\n";
+        }
+    }
+
     // airfoilDomain (for initializeMomentumExchange) must be expressed in
     // the FINEST level's own coordinates — scale by 2^interpLevel.
     plint scale = 1 << interpLevel;
+
     Box2D airfoilDomain((param::x_foil - 2) * scale, (param::x_foil + param::N_chord + 2) * scale,
                          (param::y_foil - param::N_chord/4) * scale, (param::y_foil + param::N_chord/4) * scale);
 

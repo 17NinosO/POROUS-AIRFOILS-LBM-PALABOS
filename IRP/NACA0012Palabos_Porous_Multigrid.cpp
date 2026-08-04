@@ -58,7 +58,7 @@ namespace param {
     //---------------------------------------------------------------------
     // N_chord_fine: desired EFFECTIVE chord resolution at the airfoil surface
     // (the number we actually validate against the paper's N=512/1024 cases).
-    const plint N_chord_fine = 1024;
+    const plint N_chord_fine = 400;
 
     // numLevel: number of grid levels. 2 = one coarse + one refined level.
     // Start at 2 and validate before going further (matches the earlier
@@ -103,7 +103,7 @@ namespace param {
 
     // Collision model
     enum CollisionModel { BGK, MRT };
-    const CollisionModel collisionModel = BGK;
+    const CollisionModel collisionModel = MRT;
 
     //Porosity Parameters (unused here, kept for interface parity with the
     //single-level file / porous case)

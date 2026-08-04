@@ -29,6 +29,10 @@ struct GeometryConfig {
 
     // Throats
     bool throat_enabled = true;
+    bool throat_reach_domain_edges = true;  // rectangular-block behaviour by
+                                             // default; set false for geometries
+                                             // (e.g. an airfoil) where the domain
+                                             // boundary isn't a flat wall to open
     double throat_width_mean = 3.0;
     double throat_width_std = 0.5;
     double throat_width_min = 1.5;

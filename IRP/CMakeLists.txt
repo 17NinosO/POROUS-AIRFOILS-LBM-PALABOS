@@ -47,3 +47,11 @@ add_executable(NACA0012_Porous_MG
 )
 target_link_libraries(NACA0012_Porous_MG PRIVATE ${MPI_CXX_LIBRARIES} m)
 target_compile_options(NACA0012_Porous_MG PRIVATE -O3 -Wall)
+
+add_executable(AirfoilLattice_MG
+    AirfoilLatticePalabos_Multigrid.cpp
+    ${PLB_SOURCES}
+    ${TINYXML_SOURCES}
+)
+target_link_libraries(AirfoilLattice_MG PRIVATE ${MPI_CXX_LIBRARIES} m)
+target_compile_options(AirfoilLattice_MG PRIVATE -O3 -Wall)

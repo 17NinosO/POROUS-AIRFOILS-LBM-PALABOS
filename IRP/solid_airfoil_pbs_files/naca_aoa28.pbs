@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -N naca_aoa28
+#PBS -q five_day
+#PBS -l select=1:ncpus=16:mpiprocs=16
+#PBS -l walltime=120:00:00
+#PBS -m abe
+#PBS -M k.o.ontiomoume.766@cranfield.ac.uk
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+mkdir -p results_aoa28
+cd results_aoa28
+
+module use /apps/modules/all
+module load OpenMPI/4.1.4-GCC-12.2.0
+
+mpirun -np 16 ../build/NACA0012_MG 28

@@ -49,7 +49,7 @@ namespace param {
 
     //Physical Parameters
     const T Re = 1000.0; //Reynolds number
-    const T AoA_deg = 0.0; //Angle of attack [degrees]
+    const T AoA_deg = 4.0; //Angle of attack [degrees]
     const T AoA_rad = AoA_deg * M_PI / 180.0; //Angle of attack [radians]
 
     //Lattice Resolution
