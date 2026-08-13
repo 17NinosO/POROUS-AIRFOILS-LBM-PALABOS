@@ -98,7 +98,7 @@ namespace param {
     //Simulation Control Parameters
     const plint maxIter = 100000;
     const plint outIter = 1000;
-    const T convTol = 1e-6;
+    const T convTol = 1e-6; // unused now -- early-stop convergence check removed, runs full maxIter
     const plint forceLogIter = 10;
 
     // Collision model
@@ -365,9 +365,8 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
     std::ofstream forceFile("forces.txt");
     forceFile << "iter,Cl,Cd\n";
 
-    util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol);
-
-    pcout << "Starting simulation: " << maxIter << " max iterations\n";
+    pcout << "Starting simulation: " << maxIter << " max iterations "
+          << "(runs to completion -- no early-stop, VTK written only at the end)\n";
 
     for (plint iT = 0; iT <= maxIter; ++iT) {
 
@@ -392,16 +391,10 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
         if (iT % outIter == 0) {
             T avgEnergy = computeAverageEnergy(lattice.getComponent(0));
             pcout << "iter=" << iT << " E=" << avgEnergy << "\n";
-            convergence.takeValue(avgEnergy, true);
-            if (convergence.hasConverged()) {
-                pcout << "Converged at iter=" << iT << "\n";
-                writeVTK(lattice, iT, refineBox);
-                break;
-            }
         }
 
-        if (iT % 10000 == 0 || iT == maxIter) {
-        writeVTK(lattice, iT, refineBox);
+        if (iT == maxIter) {
+            writeVTK(lattice, iT, refineBox);
         }
 
         lattice.collideAndStream();
