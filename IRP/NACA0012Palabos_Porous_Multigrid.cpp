@@ -31,6 +31,10 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <cctype>
+#include <string>
+#include <algorithm>
+#include <deque>
 
 #include "complexDynamics/mrtDynamics.h"
 #include "boundaryCondition/bounceBackModels.h"
@@ -68,8 +72,11 @@ namespace param {
     // N_chord: COARSE (level-0) chord length, derived so that the finest
     // level lands exactly on N_chord_fine. This is the constant used by
     // every downstream formula (domain size, geometry normalisation,
-    // tau/omega), exactly as in the single-level file.
-    const plint N_chord = N_chord_fine / (1 << (numLevel - 1));   // = 256
+    // tau/omega), exactly as in the single-level file. (NOTE: this value
+    // depends on BOTH N_chord_fine and numLevel -- with the current
+    // settings it is NOT 256; check the printed "N_chord(coarse)" line at
+    // runtime rather than trusting a hardcoded comment here.)
+    const plint N_chord = N_chord_fine / (1 << (numLevel - 1));
 
     //Lattice velocity
     //Must satisfy Ma_lb = U_lb / c_s << 1 for incompressible flow.
@@ -81,7 +88,11 @@ namespace param {
     const T tau = 0.5 + nu_lb / cs_sq;   //Relaxation time for BGK collision operator.
     const T omega = 1.0 / tau;           //Relaxation rate for BGK collision operator.
 
-    //MRT relaxation rates (D2Q9) — unused while collisionModel == BGK
+    //MRT relaxation rates (D2Q9) — NOT currently wired into MRTdynamics'
+    //constructor call below (which only takes omega). This is true
+    //regardless of collisionModel -- these are documented defaults for a
+    //future custom-rate implementation, not active even now that MRT is
+    //selected below.
     const T s_1 = 1.4;
     const T s_2 = 1.4;
     const T s_4 = 1.2;
@@ -98,22 +109,40 @@ namespace param {
     //Simulation Control Parameters
     const plint maxIter = 100000;
     const plint outIter = 1000;
-    const T convTol = 1e-6;
+    const T convTol = 1e-6; // relative fluctuation (std/|mean|) threshold for Cl AND Cd
     const plint forceLogIter = 10;
+
+    // Cp gets its OWN, LOOSER tolerance -- Cl/Cd are integrated quantities
+    // (summed momentum exchange over the whole surface), which smooths out
+    // local noise for free. Cp at a single station is a single lattice
+    // cell's density sample -- inherently noisier.
+    const T cpConvTol = 1e-4;
+
+    // Surface Cp and the convergence check both use genuine ROLLING
+    // windows (a circular buffer of the most recent samples), so whenever
+    // the run actually stops (early convergence OR hitting maxIter), a
+    // valid trailing window is always ready. cpAvgWindow doubles as the
+    // convergence-check window.
+    const plint cpAvgWindow = 5000;      // rolling window length, iterations
+    const plint cpSampleIter = 100;      // Cp sampling cadence within the window
+
+    // Convergence check: every convCheckIter iterations (once past the
+    // convMinIter warmup), evaluate relative fluctuation of Cl/Cd AND the
+    // max relative fluctuation of surface Cp over the last cpAvgWindow
+    // iterations. BOTH must be under tolerance for convRequiredChecks
+    // CONSECUTIVE evaluations before declaring convergence and stopping.
+    const plint convCheckIter = 1000;
+    const plint convMinIter = 20000;
+    const int convRequiredChecks = 3;
 
     // Collision model
     enum CollisionModel { BGK, MRT };
     const CollisionModel collisionModel = MRT;
 
-    //Porosity Parameters (unused here, kept for interface parity with the
-    //single-level file / porous case)
+    //Porosity Parameters
     const bool porous = true;
     const plint overlapWidth = 1;
     const plint behaviorLevel = 0;
-    const T pore_width = 0.02;
-    const int n_pores = 4;
-    const T pore_centre_x = 0.30;
-    const T pore_spacing = 0.08;
     const int n_channels = 4;
     const T channel_half_width = 0.004;   // half-thickness of each channel (chord units)
     const T channel_spacing = 0.02;      // vertical spacing between channel centers (chord units)
@@ -249,12 +278,12 @@ void writeAirfoilGeometry(const std::string& filename, int nPoints=200) {
 //resolution; Palabos rescales it for finer levels internally.
 //===================================================================================================
 
-Dynamics<T, DESCRIPTOR>* makeBulkDynamics() {
+Dynamics<T, DESCRIPTOR>* makeBulkDynamics(T omega_) {
     using namespace param;
     if (collisionModel == BGK)
-        return new BGKdynamics<T, DESCRIPTOR>(omega);
+        return new BGKdynamics<T, DESCRIPTOR>(omega_);
     else
-        return new MRTdynamics<T, DESCRIPTOR>(omega);
+        return new MRTdynamics<T, DESCRIPTOR>(omega_);
 }
 
 //===================================================================================================
@@ -334,6 +363,172 @@ void computeCoefficients(T Fx, T Fy, T& Cl, T& Cd, T AoA_rad) {
     Cd = drag / (q_inf * area);
 }
 
+//===================================================================================================
+//Surface Cp -- WINDOWED MEAN via a genuine ROLLING buffer (circular,
+//most-recent-N-samples), not a fixed-endpoint snapshot. Whichever way the
+//run ends (early convergence or hitting maxIter), a valid trailing window
+//is always ready. Samples at fine-level cells just OUTSIDE the solid
+//surface (a few cells offset along y -- AoA is applied via inflow
+//direction, not geometry rotation, so the airfoil stays axis-aligned).
+//Converts density to Cp via p = rho * cs^2. Uses computeAverageDensity()
+//on 1-cell boxes -- MPI-safe regardless of domain decomposition.
+//===================================================================================================
+
+class SurfaceCpAccumulator {
+public:
+    SurfaceCpAccumulator(int nStations_, size_t maxSamples_) : nStations(nStations_),
+        maxSamples(maxSamples_), bufUpper(nStations_), bufLower(nStations_), consecutivePasses(0) { }
+
+    void accumulate(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint interpLevel) {
+        using namespace param;
+        const plint scale = 1 << interpLevel;
+        const T q_inf_lattice = 0.5 * U_lb * U_lb;
+        const plint sampleOffsetCells = 3;
+
+        for (int k = 0; k < nStations; ++k) {
+            T x_norm = static_cast<T>(k) / static_cast<T>(nStations - 1);
+            T yt = naca0012Thickness(x_norm);
+
+            plint ix_fine = static_cast<plint>(std::round((x_foil + x_norm * N_chord) * scale));
+            plint iy_upper_fine = static_cast<plint>(std::round((y_foil + yt * N_chord) * scale)) + sampleOffsetCells;
+            plint iy_lower_fine = static_cast<plint>(std::round((y_foil - yt * N_chord) * scale)) - sampleOffsetCells;
+
+            T rho_upper = computeAverageDensity(lattice.getComponent(interpLevel),
+                                                 Box2D(ix_fine, ix_fine, iy_upper_fine, iy_upper_fine));
+            T rho_lower = computeAverageDensity(lattice.getComponent(interpLevel),
+                                                 Box2D(ix_fine, ix_fine, iy_lower_fine, iy_lower_fine));
+
+            T Cp_upper = (rho_upper - 1.0) * cs_sq / q_inf_lattice;
+            T Cp_lower = (rho_lower - 1.0) * cs_sq / q_inf_lattice;
+
+            bufUpper[k].push_back(Cp_upper);
+            if (bufUpper[k].size() > maxSamples) bufUpper[k].pop_front();
+            bufLower[k].push_back(Cp_lower);
+            if (bufLower[k].size() > maxSamples) bufLower[k].pop_front();
+        }
+    }
+
+    // Mirrors ForceConvergenceTracker::checkConverged()'s interface. Uses
+    // the WORST-CASE (max) relative fluctuation across every station and
+    // both surfaces -- a single still-noisy station shouldn't be able to
+    // hide behind many quiet ones.
+    bool checkConverged(T tol, int requiredConsecutive) {
+        if (nStations == 0 || bufUpper[0].size() < maxSamples) {
+            consecutivePasses = 0;
+            pcout << "  [Cp convergence check] window filling: "
+                  << (nStations > 0 ? bufUpper[0].size() : 0) << "/" << maxSamples << " samples\n";
+            return false;
+        }
+
+        T maxRelFluct = 0.0;
+        for (int k = 0; k < nStations; ++k) {
+            T meanU, stdU, meanL, stdL;
+            statsOf(bufUpper[k], meanU, stdU);
+            statsOf(bufLower[k], meanL, stdL);
+            T relU = std::fabs(meanU) > 1e-6 ? stdU / std::fabs(meanU) : stdU;
+            T relL = std::fabs(meanL) > 1e-6 ? stdL / std::fabs(meanL) : stdL;
+            maxRelFluct = std::max(maxRelFluct, std::max(relU, relL));
+        }
+
+        bool passed = maxRelFluct < tol;
+        consecutivePasses = passed ? (consecutivePasses + 1) : 0;
+
+        pcout << "  [Cp convergence check] max_relFluct=" << maxRelFluct
+              << " (tol=" << tol << ") consecutive_passes=" << consecutivePasses
+              << "/" << requiredConsecutive << "\n";
+
+        return consecutivePasses >= requiredConsecutive;
+    }
+
+    void writeToFile(const std::string& filename) const {
+        std::ofstream file(filename);
+        file << "x_over_c,Cp_upper_mean,Cp_upper_std,Cp_lower_mean,Cp_lower_std,n_samples\n";
+        for (int k = 0; k < nStations; ++k) {
+            T x_norm = static_cast<T>(k) / static_cast<T>(nStations - 1);
+            T meanU, stdU, meanL, stdL;
+            statsOf(bufUpper[k], meanU, stdU);
+            statsOf(bufLower[k], meanL, stdL);
+            file << x_norm << "," << meanU << "," << stdU << "," << meanL << "," << stdL << ","
+                 << bufUpper[k].size() << "\n";
+        }
+        pcout << "Windowed-mean surface Cp (" << (nStations > 0 ? bufUpper[0].size() : 0)
+              << " samples) written to " << filename << "\n";
+    }
+
+private:
+    static void statsOf(const std::deque<T>& buf, T& mean, T& stddev) {
+        if (buf.empty()) { mean = 0.0; stddev = 0.0; return; }
+        T sum = 0.0, sumSq = 0.0;
+        for (T v : buf) { sum += v; sumSq += v * v; }
+        mean = sum / buf.size();
+        T var = sumSq / buf.size() - mean * mean;
+        stddev = var > 0.0 ? std::sqrt(var) : 0.0;
+    }
+
+    int nStations;
+    size_t maxSamples;
+    std::vector<std::deque<T>> bufUpper, bufLower;
+    int consecutivePasses;
+};
+
+//===================================================================================================
+//Force-based convergence check -- replaces the old domain-averaged-energy
+//ValueTracer (prone to false positives: energy averaged over the whole
+//domain can plateau even while the near-airfoil flow is still genuinely
+//transient). Tracks Cl and Cd directly in a rolling window and requires
+//the relative fluctuation of BOTH to stay under tolerance for several
+//CONSECUTIVE checks before declaring convergence.
+//===================================================================================================
+
+class ForceConvergenceTracker {
+public:
+    ForceConvergenceTracker(size_t maxSamples_) : maxSamples(maxSamples_), consecutivePasses(0) { }
+
+    void addSample(T Cl, T Cd) {
+        clBuf.push_back(Cl);
+        if (clBuf.size() > maxSamples) clBuf.pop_front();
+        cdBuf.push_back(Cd);
+        if (cdBuf.size() > maxSamples) cdBuf.pop_front();
+    }
+
+    bool checkConverged(T tol, int requiredConsecutive) {
+        if (clBuf.size() < maxSamples) {
+            consecutivePasses = 0;
+            pcout << "  [convergence check] window filling: " << clBuf.size() << "/" << maxSamples << " samples\n";
+            return false;
+        }
+
+        T clMean, clStd, cdMean, cdStd;
+        statsOf(clBuf, clMean, clStd);
+        statsOf(cdBuf, cdMean, cdStd);
+
+        T clRelFluct = std::fabs(clMean) > 1e-12 ? clStd / std::fabs(clMean) : clStd;
+        T cdRelFluct = std::fabs(cdMean) > 1e-12 ? cdStd / std::fabs(cdMean) : cdStd;
+
+        bool passed = (clRelFluct < tol) && (cdRelFluct < tol);
+        consecutivePasses = passed ? (consecutivePasses + 1) : 0;
+
+        pcout << "  [convergence check] Cl_relFluct=" << clRelFluct
+              << " Cd_relFluct=" << cdRelFluct << " (tol=" << tol << ") "
+              << "consecutive_passes=" << consecutivePasses << "/" << requiredConsecutive << "\n";
+
+        return consecutivePasses >= requiredConsecutive;
+    }
+
+private:
+    static void statsOf(const std::deque<T>& buf, T& mean, T& stddev) {
+        T sum = 0.0, sumSq = 0.0;
+        for (T v : buf) { sum += v; sumSq += v * v; }
+        mean = sum / buf.size();
+        T var = sumSq / buf.size() - mean * mean;
+        stddev = var > 0.0 ? std::sqrt(var) : 0.0;
+    }
+
+    size_t maxSamples;
+    std::deque<T> clBuf, cdBuf;
+    int consecutivePasses;
+};
+
 // CHANGED vs single-level file: level-0 write is now a much bigger physical
 // domain at coarser spacing (still full Lx x Ly, coarse cells). Level>0
 // cropping to refineBox*scale is unchanged.
@@ -365,7 +560,10 @@ void writeVTK(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iter,
 }
 
 //===================================================================================================
-//Simulation Loop (unchanged from the flush/header-fixed single-level file)
+//Simulation Loop -- convergence now requires BOTH Cl/Cd AND surface Cp to
+//be stable (replaces the old domain-averaged-energy ValueTracer). VTK is
+//written EXACTLY ONCE, at whichever iteration the loop actually ends on
+//(early convergence or maxIter) -- not periodically.
 //===================================================================================================
 void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refineBox,
                     Box2D const& innerBox, plint interpLevel, Array<plint,2> forceIds, T AoA_rad)
@@ -374,9 +572,22 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
     std::ofstream forceFile("forces.txt");
     forceFile << "iter,Cl,Cd\n";
 
-    util::ValueTracer<T> convergence(param::U_lb, (T)param::N_chord, param::convTol);
+    // Both rolling windows sample continuously from iteration 0 (Cl/Cd) or
+    // from convMinIter (Cp, gated to avoid wasting MPI-reduction calls on
+    // early transient data that would just get flushed out later anyway).
+    SurfaceCpAccumulator cpAccum(100, static_cast<size_t>(cpAvgWindow / cpSampleIter));
+    ForceConvergenceTracker convTracker(static_cast<size_t>(cpAvgWindow / forceLogIter));
 
-    pcout << "Starting simulation: " << maxIter << " max iterations\n";
+    pcout << "Starting simulation: " << maxIter << " max iterations (hard cap)\n";
+    pcout << "Early stop requires BOTH checks to pass, " << convRequiredChecks
+          << " consecutive times, no earlier than iter " << convMinIter << ":\n";
+    pcout << "  1) Force check:  Cl/Cd relative fluctuation < " << convTol
+          << " over a rolling " << cpAvgWindow << "-iteration window\n";
+    pcout << "  2) Cp check:     max relative fluctuation across all surface stations < " << cpConvTol
+          << " over the same window (sampled every " << cpSampleIter << " iterations)\n";
+
+    plint finalIter = maxIter;
+    bool convergedEarly = false;
 
     for (plint iT = 0; iT <= maxIter; ++iT) {
 
@@ -396,28 +607,49 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
             computeCoefficients(Fx, Fy, Cl, Cd, AoA_rad);
             forceFile << iT << "," << Cl << "," << Cd << "\n";
             forceFile.flush();
+            convTracker.addSample(Cl, Cd);
         }
 
         if (iT % outIter == 0) {
             T avgEnergy = computeAverageEnergy(lattice.getComponent(0));
             pcout << "iter=" << iT << " E=" << avgEnergy << "\n";
-            convergence.takeValue(avgEnergy, true);
-            if (convergence.hasConverged()) {
-                pcout << "Converged at iter=" << iT << "\n";
+        }
+
+        if (iT >= convMinIter && iT % cpSampleIter == 0) {
+            cpAccum.accumulate(lattice, interpLevel);
+        }
+
+        if (iT >= convMinIter && iT % convCheckIter == 0) {
+            // Evaluate BOTH unconditionally every time -- short-circuiting
+            // on `forceOK && cpAccum.checkConverged(...)` would skip the Cp
+            // check whenever forceOK is false, leaving its consecutive-pass
+            // streak stale instead of correctly updating/resetting.
+            bool forceOK = convTracker.checkConverged(convTol, convRequiredChecks);
+            bool cpOK = cpAccum.checkConverged(cpConvTol, convRequiredChecks);
+
+            if (forceOK && cpOK) {
+                pcout << "Converged (forces AND Cp both stable) at iter=" << iT
+                      << " -- stopping early.\n";
+                finalIter = iT;
+                convergedEarly = true;
                 writeVTK(lattice, iT, refineBox, innerBox);
                 break;
             }
         }
 
-        if (iT % 10000 == 0 || iT == maxIter) {
-        writeVTK(lattice, iT, refineBox, innerBox);
+        if (iT == maxIter) {
+            writeVTK(lattice, iT, refineBox, innerBox);
         }
 
         lattice.collideAndStream();
     }
 
     forceFile.close();
-    pcout << "Simulation complete. Forces saved to forces.txt\n";
+    pcout << "Simulation complete at iter=" << finalIter
+          << (convergedEarly ? " (converged early)" : " (hit maxIter cap, did not converge)")
+          << ". Forces saved to forces.txt\n";
+
+    cpAccum.writeToFile("surface_cp.csv");
 }
 
 //===================================================================================================
@@ -426,6 +658,14 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
 
 int main(int argc, char* argv[]) {
     plbInit(&argc, &argv);
+
+    // Force every std::cout write to flush IMMEDIATELY -- default C++
+    // stdio block-buffers output whenever it's not connected to an
+    // interactive terminal (piped through tee, redirected to a file, or
+    // run under PBS). Without this, the new convergence-check output
+    // below can sit invisible in a buffer for a long time even though
+    // it's genuinely already been printed.
+    std::cout << std::unitbuf;
 
     T AoA_deg_runtime = (argc > 1) ? std::atof(argv[1]) : param::AoA_deg;
     T AoA_rad_runtime = AoA_deg_runtime * M_PI / 180.0;
@@ -473,7 +713,7 @@ int main(int argc, char* argv[]) {
 
     MultiGridLattice2D<T, DESCRIPTOR> lattice =
         *MultiGridGenerator2D<T, DESCRIPTOR>::createRefinedLatticeCubicInterpolationFiltering(
-            management, makeBulkDynamics(), behaviorLevel);
+            management, makeBulkDynamics(param::omega), behaviorLevel);
     pcout << "Lattice built (numLevel=" << numLevel << ")\n";
 
     Box2D bb0 = lattice.getComponent(0).getBoundingBox();
@@ -486,14 +726,21 @@ int main(int argc, char* argv[]) {
     // Explicitly rescale relaxation rate per level (Lagrava et al. 2012, Eq. 24),
     // overriding whatever the generator assigned internally — verifies correctness
     // rather than trusting unconfirmed library behavior.
+    //
+    // BUG FIX: this used to hardcode BGKdynamics on every refined level
+    // regardless of param::collisionModel -- so with collisionModel=MRT
+    // (as set above), levels 1 and 2 were silently running BGK while only
+    // level 0 was genuinely MRT. Now uses makeBulkDynamics(), which
+    // respects collisionModel consistently on every level.
     {
+        std::string modelStr = (param::collisionModel == param::BGK) ? "BGK" : "MRT";
         T omega_level = param::omega;   // level 0's omega
         for (plint iLevel = 1; iLevel < numLevel; ++iLevel) {
             omega_level = 2.0 * omega_level / (4.0 - omega_level);
             MultiBlockLattice2D<T, DESCRIPTOR>& comp = lattice.getComponent(iLevel);
-            defineDynamics(comp, comp.getBoundingBox(), new BGKdynamics<T, DESCRIPTOR>(omega_level));
+            defineDynamics(comp, comp.getBoundingBox(), makeBulkDynamics(omega_level));
             pcout << "Level " << iLevel << " rescaled omega = " << omega_level
-                  << " (tau = " << 1.0/omega_level << ")\n";
+                  << " (tau = " << 1.0/omega_level << ", model = " << modelStr << ")\n";
         }
     }
 
