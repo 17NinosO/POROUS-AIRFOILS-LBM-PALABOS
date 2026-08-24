@@ -39,6 +39,8 @@
 #include <functional>
 #include <algorithm>
 #include <utility>
+#include <unordered_map>
+#include <cstdint>
 
 namespace geom {
 
@@ -334,6 +336,159 @@ inline std::vector<std::pair<int,int>> findOverlaps(const LatticeGeometry& g, pl
         }
     }
     return overlaps;
+}
+
+// ============================================================================
+// CONFORMING LATTICE -- mini-airfoils arranged to trace the outline of one
+// BIG NACA0012, instead of a rectangular grid. Row count tapers with the
+// local envelope thickness (few rows near LE/TE, more near max thickness),
+// and each column's angle follows the local surface slope. Permeability is
+// controlled by pitch_s/pitch_n relative to the mini-airfoil's own chord.
+// ============================================================================
+
+struct ConformingLatticeParams {
+    plint N_chord_big = 2000;     // overall/big airfoil chord, COARSE lattice units
+    T c_mini_frac = 0.035;        // mini-airfoil chord, as a FRACTION of N_chord_big -- resolution knob
+    T pitch_s_factor = 1.3;       // chordwise column spacing, in units of c_mini
+    T pitch_n_factor = 1.0;       // spanwise row spacing, in units of c_mini
+    T pivot_chords = 0.25;        // mini-airfoil rotation pivot (quarter-chord)
+    T x_margin = 0.02;            // start/end margin (fraction of big chord) -- avoids the
+                                   // exact LE/TE point where the envelope slope is singular
+};
+
+// Builds the unit list. Reuses AirfoilUnit/LatticeGeometry so all the
+// existing I/O (writeLatticeCenters, writeLatticeSurfaces) and the
+// overlap checker work unmodified on the result.
+inline LatticeGeometry buildConformingLattice(const ConformingLatticeParams& p) {
+    LatticeGeometry g;
+    const T C = static_cast<T>(p.N_chord_big);
+    const T pitch_s = p.pitch_s_factor * p.c_mini_frac;
+    const T pitch_n = p.pitch_n_factor * p.c_mini_frac;
+
+    int colIdx = 0;
+    T x = p.x_margin;
+    while (x <= 1.0 - p.x_margin) {
+        T thick = naca0012Thickness(x);          // local half-thickness, fraction of big chord
+        // local envelope slope via central difference
+        T h = 1e-4;
+        T x0 = std::max(h, x - h), x1 = std::min(1.0 - h, x + h);
+        T slope = (naca0012Thickness(x1) - naca0012Thickness(x0)) / (x1 - x0);
+        T angle_rad = std::atan(slope);
+
+        int ny = static_cast<int>(2.0 * thick / pitch_n);
+        for (int r = 0; r < ny; ++r) {
+            // FIXED vs earlier version: row offset now scales with the
+            // ACTUAL local half-thickness (thick), not a fixed pitch_n
+            // step from the centerline. Evenly distributes ny rows across
+            // the true [-thick, +thick] envelope at THIS station, so the
+            // outermost rows sit at the real surface height everywhere --
+            // giving a continuously tapering silhouette instead of rows
+            // snapping to the same fixed height regardless of position.
+            // ny itself is still chosen (above) from pitch_n, so minimum
+            // row-to-row spacing is still respected; this only changes
+            // WHERE those ny rows sit, not how many there are.
+            T offset = (ny > 1) ? thick * (2.0 * (r + 0.5) / ny - 1.0) : 0.0;
+            AirfoilUnit u;
+            u.i = r;
+            u.j = colIdx;
+            u.cx = x * C;
+            u.cy = offset * C;
+            u.theta_rad = -angle_rad;   // matches the sketch's sign convention
+            g.units.push_back(u);
+        }
+        ++colIdx;
+        x += pitch_s;
+    }
+
+    g.Lx = p.N_chord_big;   // caller applies margins on top, same as buildLattice()'s convention
+    g.Ly = p.N_chord_big;   // (placeholder -- real domain sizing uses the big airfoil's own extent)
+    return g;
+}
+
+// IMPORTANT: every isInsideUnit/isInsideLattice/findOverlaps/buildSpatialHash
+// call on a conforming lattice's output MUST use the MINI-airfoil's own
+// chord length (N_chord_big * c_mini_frac), NOT N_chord_big itself -- the
+// individual units are sized to c_mini, not the big airfoil. Use this
+// helper rather than recomputing it inline; passing N_chord_big by mistake
+// silently makes every unit appear ~1/c_mini_frac times too large (e.g. 28x
+// oversized for c_mini_frac=0.035), which inflates every point-in-solid
+// test, every overlap check, and every spatial-hash bucket size at once --
+// exactly the mistake that produced garbage overlap counts and a misleading
+// efficiency benchmark during this header's own development.
+inline plint conformingChordUnits(const ConformingLatticeParams& p) {
+    return static_cast<plint>(p.c_mini_frac * static_cast<T>(p.N_chord_big));
+}
+
+// ---------------------------------------------------------------------
+// Spatial hash grid -- O(1) amortized point-in-lattice queries instead of
+// O(N_units) brute force. Bucket size = R, the mini-airfoil's own worst-
+// case reach from its pivot -- the standard uniform-grid correctness
+// argument: any point within R of a unit's center falls in that unit's
+// bucket or an immediately adjacent one, so a 3x3 neighborhood search
+// is guaranteed not to miss anything.
+// ---------------------------------------------------------------------
+
+class SpatialHashGrid {
+public:
+    void build(const std::vector<AirfoilUnit>& units, T cellSize_) {
+        cellSize = cellSize_;
+        buckets.clear();
+        for (size_t idx = 0; idx < units.size(); ++idx) {
+            int ix = static_cast<int>(std::floor(units[idx].cx / cellSize));
+            int iy = static_cast<int>(std::floor(units[idx].cy / cellSize));
+            buckets[key(ix, iy)].push_back(static_cast<int>(idx));
+        }
+    }
+
+    void queryCandidates(T x, T y, std::vector<int>& out) const {
+        out.clear();
+        int qx = static_cast<int>(std::floor(x / cellSize));
+        int qy = static_cast<int>(std::floor(y / cellSize));
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                auto it = buckets.find(key(qx + dx, qy + dy));
+                if (it != buckets.end()) {
+                    out.insert(out.end(), it->second.begin(), it->second.end());
+                }
+            }
+        }
+    }
+
+private:
+    static int64_t key(int ix, int iy) {
+        return (static_cast<int64_t>(ix) << 32) | (static_cast<uint32_t>(iy));
+    }
+
+    T cellSize = 1.0;
+    std::unordered_map<int64_t, std::vector<int>> buckets;
+};
+
+// Builds a SpatialHashGrid sized correctly for a given unit list. Call
+// once after buildLattice()/buildConformingLattice(), reuse the returned
+// grid for every stamping query (it's read-only after build()).
+inline SpatialHashGrid buildSpatialHash(const std::vector<AirfoilUnit>& units,
+                                         plint N_chord, T pivot_chords = 0.25) {
+    T R = (std::max(pivot_chords, 1.0 - pivot_chords) + 0.06) * static_cast<T>(N_chord);
+    SpatialHashGrid grid;
+    grid.build(units, R);
+    return grid;
+}
+
+// Accelerated replacement for isInsideLattice() -- same result, O(1)
+// amortized instead of O(N_units). Takes a REUSABLE scratch buffer
+// (`scratch`) so repeated calls (e.g. once per domain cell during
+// stamping) don't heap-allocate a fresh vector every time -- that
+// allocation cost is easy to accidentally make the dominant cost at
+// this query volume. Not thread-safe if the same scratch buffer is
+// shared across parallel calls -- give each thread/task its own.
+inline bool isInsideLatticeFast(T x, T y, const std::vector<AirfoilUnit>& units,
+                                 const SpatialHashGrid& grid, plint N_chord,
+                                 std::vector<int>& scratch, T pivot_chords = 0.25) {
+    grid.queryCandidates(x, y, scratch);
+    for (int idx : scratch) {
+        if (isInsideUnit(x, y, units[idx], N_chord, pivot_chords)) return true;
+    }
+    return false;
 }
 
 } // namespace geom
