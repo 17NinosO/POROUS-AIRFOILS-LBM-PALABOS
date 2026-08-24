@@ -55,3 +55,19 @@ add_executable(AirfoilLattice_MG
 )
 target_link_libraries(AirfoilLattice_MG PRIVATE ${MPI_CXX_LIBRARIES} m)
 target_compile_options(AirfoilLattice_MG PRIVATE -O3 -Wall)
+
+add_executable(NACA0012_MRT_BGK
+    NACA0012Palabos_MRT_vs_BGK.cpp
+    ${PLB_SOURCES}
+    ${TINYXML_SOURCES}
+)
+target_link_libraries(NACA0012_MRT_BGK PRIVATE ${MPI_CXX_LIBRARIES} m)
+target_compile_options(NACA0012_MRT_BGK PRIVATE -O3 -Wall)
+
+add_executable(NACA0012_Conforming
+    NACA0012Palabos_ConformingLattice.cpp
+    ${PLB_SOURCES}
+    ${TINYXML_SOURCES}
+)
+target_link_libraries(NACA0012_Conforming PRIVATE ${MPI_CXX_LIBRARIES} m)
+target_compile_options(NACA0012_Conforming PRIVATE -O3 -Wall)
