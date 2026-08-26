@@ -66,10 +66,10 @@ namespace param {
     // (the number we actually validate against the paper's N=512/1024 cases).
     const plint N_chord_fine = 400;
 
-    // numLevel: number of grid levels. 2 = one coarse + one refined level.
-    // Start at 2 and validate before going further (matches the earlier
-    // conservative-first approach used throughout this project).
-    const plint numLevel = 2;
+    // numLevel: number of grid levels. 3 = coarse + two nested refined
+    // levels -- the inner level gives the extra near-surface resolution
+    // needed to properly resolve the small pore openings once porous=true.
+    const plint numLevel = 3;
 
     // N_chord: COARSE (level-0) chord length, derived so that the finest
     // level lands exactly on N_chord_fine. This is the constant used by
@@ -156,9 +156,10 @@ namespace param {
     enum CollisionModel { BGK, MRT };
     const CollisionModel collisionModel = MRT;
 
-    //Porosity Parameters (unused here, kept for interface parity with the
-    //single-level file / porous case)
-    const bool porous = false;
+    //Porosity Parameters -- ENABLED. isInsidePore() cuts n_pores localized
+    //slots of width pore_width (fraction of chord) at fixed x-stations,
+    //spaced pore_spacing apart, centered at pore_centre_x.
+    const bool porous = true;
     const plint overlapWidth = 1;
     const plint behaviorLevel = 0;
     const T pore_width = 0.02;
@@ -578,18 +579,26 @@ private:
     int consecutivePasses;
 };
 
-// CHANGED vs single-level file: level-0 write is now a much bigger physical
-// domain at coarser spacing (still full Lx x Ly, coarse cells). Level>0
-// cropping to refineBox*scale is unchanged.
-void writeVTK(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iter, Box2D const& refineBox) {
+// CHANGED for 3-level: level 1 uses refineBox (outer patch), level 2 uses
+// innerBox (tight nested patch around the airfoil/pores) -- NOT refineBox
+// scaled further, which would just re-show the same region as level 1 at
+// higher resolution instead of the genuinely narrower inner patch.
+void writeVTK(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iter,
+              Box2D const& refineBox, Box2D const& innerBox) {
     for (plint iLevel = 0; iLevel < lattice.getNumLevels(); ++iLevel) {
         MultiBlockLattice2D<T, DESCRIPTOR>& c = lattice.getComponent(iLevel);
 
         Box2D writeBox = c.getBoundingBox();
-        if (iLevel > 0) {
+        if (iLevel == 1) {
             plint scale = 1 << iLevel;
             writeBox = Box2D(refineBox.x0 * scale, refineBox.x1 * scale,
                               refineBox.y0 * scale, refineBox.y1 * scale);
+        } else if (iLevel >= 2) {
+            // innerBox is already expressed in level-1 coordinates, so
+            // only one further doubling per additional level is needed.
+            plint scale = 1 << (iLevel - 1);
+            writeBox = Box2D(innerBox.x0 * scale, innerBox.x1 * scale,
+                              innerBox.y0 * scale, innerBox.y1 * scale);
         }
 
         VtkImageOutput2D<T> vtkOut(
@@ -605,7 +614,8 @@ void writeVTK(MultiGridLattice2D<T, DESCRIPTOR>& lattice, plint iter, Box2D cons
 //Simulation Loop (unchanged from the flush/header-fixed single-level file)
 //===================================================================================================
 void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refineBox,
-                    plint interpLevel, Array<plint,2> forceIds, T AoA_rad, const std::string& runTag)
+                    Box2D const& innerBox, plint interpLevel, Array<plint,2> forceIds,
+                    T AoA_rad, const std::string& runTag)
 {
     using namespace param;
     std::string forcesFilename = "forces_" + runTag + ".txt";
@@ -675,13 +685,13 @@ void runSimulation(MultiGridLattice2D<T, DESCRIPTOR>& lattice, Box2D const& refi
                       << " -- stopping early.\n";
                 finalIter = iT;
                 convergedEarly = true;
-                writeVTK(lattice, iT, refineBox);
+                writeVTK(lattice, iT, refineBox, innerBox);
                 break;
             }
         }
 
         if (iT == maxIter) {
-            writeVTK(lattice, iT, refineBox);
+            writeVTK(lattice, iT, refineBox, innerBox);
         }
 
         lattice.collideAndStream();
@@ -775,6 +785,18 @@ int main(int argc, char* argv[]) {
                      param::y_foil - 4*param::N_chord, param::y_foil + 4*param::N_chord);
     management.refine(0, refineBox);
 
+    // Second refinement: level 1 -> level 2, a TIGHT box nested close
+    // around the airfoil (0.1c upstream/downstream margin, 0.125c
+    // above/below) -- same nesting pattern as the porous 3-level file.
+    // Coordinates are in LEVEL-1 units (refine() from level 1 expects
+    // that level's own coordinate frame), hence the innerScale=2 factor.
+    plint innerScale = 1 << 1;
+    Box2D innerBox((param::x_foil - param::N_chord/10) * innerScale,
+                    (param::x_foil + param::N_chord*11/10) * innerScale,
+                    (param::y_foil - param::N_chord/8) * innerScale,
+                    (param::y_foil + param::N_chord/8) * innerScale);
+    management.refine(1, innerBox);
+
     plint xTiles = global::mpi().getSize(), yTiles = 1, interpLevel = numLevel - 1;
     ParallellizeBySquares2D* parallelizer = new ParallellizeBySquares2D(
         management.getBulks(), management.getBoundingBox(interpLevel), xTiles, yTiles);
@@ -838,7 +860,7 @@ int main(int argc, char* argv[]) {
 
     pcout << "t=0 check: avgEnergy = " << computeAverageEnergy(lattice.getComponent(0)) << "\n";
 
-    runSimulation(lattice, refineBox, interpLevel, forceIds, AoA_rad_runtime, runTag);
+    runSimulation(lattice, refineBox, innerBox, interpLevel, forceIds, AoA_rad_runtime, runTag);
 
     return 0;
 }
